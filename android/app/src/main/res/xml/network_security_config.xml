@@ -6,4 +6,24 @@
       <certificates src="@raw/sectigo_r46" />
     </trust-anchors>
   </base-config>
+  
+  <!-- Configuración específica para PayPhone -->
+  <domain-config>
+    <domain includeSubdomains="true">payphonetodoesposible.com</domain>
+    <domain includeSubdomains="true">pay.payphonetodoesposible.com</domain>
+    <trust-anchors>
+      <certificates src="system" />
+      <certificates src="@raw/sectigo_r46" />
+    </trust-anchors>
+  </domain-config>
+  
+  <!-- Configuración para Kestore -->
+  <domain-config>
+    <domain includeSubdomains="true">kestore.com.ec</domain>
+    <domain includeSubdomains="true">www.kestore.com.ec</domain>
+    <trust-anchors>
+      <certificates src="system" />
+      <certificates src="@raw/sectigo_r46" />
+    </trust-anchors>
+  </domain-config>
 </network-security-config>
