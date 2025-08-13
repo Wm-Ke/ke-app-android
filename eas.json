@@ -1,0 +1,55 @@
+{
+  "cli": {
+    "appVersionSource": "local"
+  },
+  "build": {
+    "production": {
+      "developmentClient": false,
+      "distribution": "store",
+      "channel": "production",
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "ios": {
+        "resourceClass": "m-medium"
+      },
+      "env": {
+        "EXPO_GOOGLE_PLAY_SERVICES_VERSION": "18.2.0"
+      }
+    },
+    "apk-test": {
+      "developmentClient": false,
+      "distribution": "internal",
+      "channel": "preview",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_GOOGLE_PLAY_SERVICES_VERSION": "18.2.0"
+      }
+    },
+    "android-dev": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "dev-debug",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_GOOGLE_PLAY_SERVICES_VERSION": "18.2.0",
+        "EXPO_PUBLIC_DEVCLIENT": "1" 
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "android": {
+        "serviceAccountKeyPath": "./keys/service-account.json"
+      },
+      "ios": {
+        "appleId": "cevallos.oswaldo@icloud.com",
+        "ascAppId": "6745459007"
+      }
+    }
+  }
+}
