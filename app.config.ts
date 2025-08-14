@@ -1,13 +1,13 @@
 import { ConfigContext, ExpoConfig } from "@expo/config";
-// si prefieres tomarlo de package.json:  import pkg from "./package.json";
 
 export default ({ config }: ConfigContext): ExpoConfig => ({
   ...config,
 
+  // ====== App metadata ======
   name: "Keapp",
   slug: "keapp",
   scheme: "kestoreec",
-  version: "1.0.8",
+  version: "1.0.8", // <- si subes a PROD, súbelo (p.ej. 1.0.9)
   orientation: "default",
   userInterfaceStyle: "automatic",
   owner: "wm-notificaciones",
@@ -20,29 +20,35 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   },
   assetBundlePatterns: ["**/*"],
 
+  // ====== OTA / Updates ======
   updates: {
     url: "https://u.expo.dev/f1c0a9ca-595e-4122-af9b-b27f196a7988",
+    fallbackToCacheTimeout: 0,
   },
-  // ✅ En bare debe ser string, no policy
-  // runtimeVersion: pkg.version as string,
+  // Si prefieres no actualizar esto a mano, puedes usar:
+  // runtimeVersion: { policy: "appVersion" },
   runtimeVersion: "1.0.8",
 
   extra: {
     eas: { projectId: "d1ba3c41-db4d-4c80-95a3-1a18dfa35aab" },
   },
 
+  // ====== Status bar ======
   androidStatusBar: {
     translucent: true,
     barStyle: "light-content",
   },
 
+  // ====== ANDROID ONLY ======
   android: {
-    package: "com.ke.ecuadorv2", // (nota: en bare lo que cuenta es android/app/build.gradle)
-    versionCode: 14,
+    package: "com.ke.ecuadorv2",
+    versionCode: 14, // <- súbelo en cada release (15, 16, ...)
     adaptiveIcon: {
       foregroundImage: "./assets/images/adaptive-icon.png",
       backgroundColor: "#000000",
     },
+
+    // Mantengo tus permisos. Si no usas alguno en nativo, puedes limpiarlos.
     permissions: [
       "INTERNET",
       "ACCESS_NETWORK_STATE",
@@ -56,6 +62,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
       "VIBRATE",
       "WAKE_LOCK",
     ],
+
+    // App Links (autoVerify): recuerda publicar /.well-known/assetlinks.json
     intentFilters: [
       {
         action: "VIEW",
@@ -90,27 +98,11 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     ],
   },
 
-  ios: {
-    bundleIdentifier: "com.ke.newapp",
-    buildNumber: "8",
-    supportsTablet: true,
-    infoPlist: {
-      ITSAppUsesNonExemptEncryption: false,
-      NSCameraUsageDescription:
-        "Esta app necesita acceso a la cámara para que puedas subir fotos o escanear códigos.",
-      NSMicrophoneUsageDescription:
-        "Esta app necesita acceso al micrófono para grabar audio o usar videollamadas.",
-      NSPhotoLibraryUsageDescription:
-        "Esta app necesita acceso a tu galería para que puedas seleccionar imágenes.",
-      NSLocationWhenInUseUsageDescription:
-        "Esta app necesita tu ubicación para mostrarte productos cercanos y mejorar la entrega de tus pedidos.",
-      NSUserTrackingUsageDescription:
-        "Solicitamos permiso de seguimiento para mostrarte anuncios personalizados.",
-    },
-  },
-
+  // ====== Plugins ======
   plugins: [
     "expo-updates",
+    "expo-navigation-bar", // modo inmersivo (ocultar barra inferior)
+
     [
       "expo-splash-screen",
       {
@@ -140,16 +132,23 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
           composeCompilerVersion: "1.5.15",
           kspVersion: "1.9.25-1.0.20",
 
-          // En bare, esta bandera puede ser ignorada por tener /android.
-          // Para dev client, si necesitas HTTP, ponlo también en AndroidManifest (debug).
+          // HTTPS only (si necesitas HTTP en dev, se maneja en AndroidManifest debug)
           manifestApplicationAttributes: {
             "android:usesCleartextTraffic": "false",
           },
         },
       },
     ],
+
+    // 🔸 imprescindible para abrir apps sociales en Android 11+
+    ["./plugins/with-android-queries.js"],
+
+    // Tu trust anchor (certificado)
     ["./plugins/with-r46-trust-anchor", { certPath: "certs/sectigo_r46.cer" }],
   ],
 
+  // ====== Web (no afecta Android nativo) ======
   web: { favicon: "./assets/favicon.png" },
+
+  // ❌ iOS: se elimina porque este proyecto es solo Android.
 });

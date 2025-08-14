@@ -1,65 +1,53 @@
-// App.tsx — Android only - Optimizado para PayPhone
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+// App.tsx — Android
+// PayPhone OK + Deep Links sociales + Modo inmersivo (inset) +
+// Persistencia de última URL y posición de scroll con LRU (restauración al reabrir)
+
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AppState,
   BackHandler,
   Linking,
   Platform,
-  SafeAreaView,
   Share,
   StatusBar,
   StyleSheet,
   View,
   Alert,
 } from "react-native";
-import {
-  WebView,
-  WebViewMessageEvent,
-  WebViewNavigation,
-} from "react-native-webview";
+import { WebView, WebViewMessageEvent } from "react-native-webview";
 import CookieManager from "@react-native-cookies/cookies";
+import * as NavigationBar from "expo-navigation-bar";
+import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const IS_ANDROID = Platform.OS === "android";
 
-// ======= Ajustes =======
+// ================= Config =================
 const HOME_URL = "https://www.kestore.com.ec/";
 const ORIGINS = new Set(["kestore.com.ec", "www.kestore.com.ec"]);
+const isPayHost = (h: string) =>
+  /(^|\.)payphonetodoesposible\.com$/i.test(h || "");
+const PAY_ERR_KEYS = [
+  "no autorizado",
+  "unauthorized",
+  "denegado",
+  "/error",
+  "/expired",
+];
 
-const PAY_HOSTS = new Set([
-  "pay.payphonetodoesposible.com",
-  "payphonetodoesposible.com",
-  "www.payphonetodoesposible.com",
-]);
-
-const PAY_SUCCESS_KEYS = ["success", "/approved", "resultado=aprobado"];
-const PAY_CANCEL_KEYS = ["cancel", "/cancel", "resultado=cancelado"];
-const PAY_ERROR_KEYS = ["no autorizado", "unauthorized", "denegado", "/error"];
-
+// UA móvil realista
 const UA =
-  "Mozilla/5.0 (Linux; Android 10; KestoreApp) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36 KestoreApp/1.0.8";
+  "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36";
 
-// ======= Configuración de logging =======
-const DEBUG_COOKIES = true; // Siempre habilitado para debugging
-const logCookieInfo = (message: string, data?: any) => {
-  const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] [COOKIE_DEBUG] ${message}`;
-  console.log(logMessage, data || "");
+// ================= Persistencia =================
+const LAST_URL_KEY = "@kestore_last_url";
+const SCROLL_PREFIX = "@kestore_scroll:"; // key por URL canonical
+const SCROLL_INDEX_KEY = "@kestore_scroll_index"; // índice LRU
+const MAX_SCROLL_ENTRIES = 30; // tope LRU
 
-  // También log como warn para que sea más visible
-  if (
-    message.includes("Error") ||
-    message.includes("no autorizado") ||
-    message.includes("unauthorized")
-  ) {
-    console.warn(logMessage, data || "");
-  }
-};
+// ================= Utils ===================
+const log = (msg: string, extra?: any) =>
+  console.log(`[${new Date().toISOString()}] [APP] ${msg}`, extra ?? "");
 
 const isHttp = (u: string) => /^https?:\/\//i.test(u);
 const hostOf = (u: string) => {
@@ -69,17 +57,25 @@ const hostOf = (u: string) => {
     return "";
   }
 };
+const pathOf = (u: string) => {
+  try {
+    return new URL(u).pathname;
+  } catch {
+    return "";
+  }
+};
 const isKestore = (u: string) => ORIGINS.has(hostOf(u));
-const isPayHost = (h: string) => PAY_HOSTS.has(h.toLowerCase());
-const looksLikeShareIntent = (u: string) => u.startsWith("share:");
 const isSocialScheme = (u: string) =>
-  /^(whatsapp|fb|instagram|tiktok|youtube|intent):/i.test(u);
+  /^(whatsapp|fb|instagram|tiktok|youtube|twitter|x|vnd\.youtube|mailto|tel|intent):/i.test(
+    u
+  );
+const looksLikeShareIntent = (u: string) => u.startsWith("share:");
 
-// Debounce sencillo para evitar doble share
+// share debounce
 let lastShareTs = 0;
 const shareDebounced = async (title?: string, url?: string) => {
   const now = Date.now();
-  if (now - lastShareTs < 900) return;
+  if (now - lastShareTs < 800) return;
   lastShareTs = now;
   const message = url ? `${title ? title + "\n" : ""}${url}` : title || "";
   if (!message) return;
@@ -88,717 +84,586 @@ const shareDebounced = async (title?: string, url?: string) => {
   } catch {}
 };
 
-// ======= Manejo mejorado de cookies =======
-const PAYPHONE_COOKIE_KEY = "@kestore_payphone_cookies";
+// ================= Deep links sociales =================
+function mapSocialToApp(
+  originalUrl: string
+): { appUrls: string[]; packages: string[] } | null {
+  if (!isHttp(originalUrl)) return null;
+  const url = new URL(originalUrl);
+  const host = url.host.toLowerCase();
+  const path = url.pathname;
+  const q = url.searchParams;
 
-// Guardar cookies de PayPhone antes de limpiar
-const savePayPhoneCookies = async () => {
-  try {
-    logCookieInfo("🔄 Iniciando guardado de cookies de PayPhone...");
-    const cookies: Record<string, any> = {};
-    let totalCookies = 0;
-
-    for (const host of PAY_HOSTS) {
-      const url = `https://${host}`;
-      logCookieInfo(`📡 Obteniendo cookies de: ${url}`);
-
-      const hostCookies = await CookieManager.get(url);
-      const cookieCount = hostCookies ? Object.keys(hostCookies).length : 0;
-
-      if (hostCookies && cookieCount > 0) {
-        cookies[host] = hostCookies;
-        totalCookies += cookieCount;
-        logCookieInfo(
-          `💾 Guardando ${cookieCount} cookies para ${host}:`,
-          hostCookies
-        );
-      } else {
-        logCookieInfo(`⚠️ No se encontraron cookies para ${host}`);
-      }
-    }
-
-    if (Object.keys(cookies).length > 0) {
-      await AsyncStorage.setItem(PAYPHONE_COOKIE_KEY, JSON.stringify(cookies));
-      logCookieInfo(
-        `✅ ${totalCookies} cookies de PayPhone guardadas exitosamente`
-      );
+  // WhatsApp
+  if (host === "wa.me" || host === "api.whatsapp.com") {
+    let phone = "";
+    let text = "";
+    if (host === "wa.me") {
+      const parts = path.split("/").filter(Boolean);
+      if (parts[0]) phone = parts[0].replace(/\D/g, "");
+      text = q.get("text") || "";
     } else {
-      logCookieInfo("⚠️ No hay cookies de PayPhone para guardar");
+      phone = (q.get("phone") || "").replace(/\D/g, "");
+      text = q.get("text") || "";
     }
-  } catch (error) {
-    logCookieInfo("❌ Error guardando cookies de PayPhone:", error);
+    const app = `whatsapp://send${phone ? `?phone=${phone}` : ""}${
+      text ? `${phone ? "&" : "?"}text=${encodeURIComponent(text)}` : ""
+    }`;
+    return {
+      appUrls: [app, "whatsapp://send"],
+      packages: ["com.whatsapp", "com.whatsapp.w4b"],
+    };
   }
-};
 
-// Restaurar cookies de PayPhone
-const restorePayPhoneCookies = async () => {
-  try {
-    const savedCookies = await AsyncStorage.getItem(PAYPHONE_COOKIE_KEY);
-    if (savedCookies) {
-      const cookies = JSON.parse(savedCookies);
-      for (const [host, hostCookies] of Object.entries(cookies)) {
-        const url = `https://${host}`;
-        for (const [name, cookie] of Object.entries(
-          hostCookies as Record<string, any>
-        )) {
-          try {
-            await CookieManager.set(url, {
-              name,
-              value: cookie.value,
-              domain: cookie.domain || host,
-              path: cookie.path || "/",
-              secure: true,
-              httpOnly: cookie.httpOnly || false,
-            });
-          } catch (cookieError) {
-            logCookieInfo(`Error restaurando cookie ${name}:`, cookieError);
-          }
-        }
-        logCookieInfo(`Cookies restauradas para ${host}`);
-      }
-      await CookieManager.flush();
-    }
-  } catch (error) {
-    logCookieInfo("Error restaurando cookies de PayPhone:", error);
+  // Facebook
+  if (host.endsWith("facebook.com") || host === "m.facebook.com") {
+    const faceModal = `fb://facewebmodal/f?href=${encodeURIComponent(
+      originalUrl
+    )}`;
+    return {
+      appUrls: [faceModal, "fb://profile"],
+      packages: ["com.facebook.katana"],
+    };
   }
-};
 
-// Limpieza selectiva de cookies (solo cuando es necesario)
-const clearDomainCookies = async (domain: string, force = false) => {
-  try {
-    if (!force) {
-      logCookieInfo(
-        `Saltando limpieza de cookies para ${domain} (conservando sesión)`
-      );
-      return;
+  // Instagram
+  if (host.endsWith("instagram.com")) {
+    const parts = path.split("/").filter(Boolean);
+    const username =
+      parts[0] && !["p", "reels", "stories", "explore"].includes(parts[0])
+        ? parts[0]
+        : "";
+    const appUrls = username
+      ? [
+          `instagram://user?username=${username}`,
+          `instagram://library`,
+          `instagram://app`,
+        ]
+      : [`instagram://app`];
+    return { appUrls, packages: ["com.instagram.android"] };
+  }
+
+  // YouTube / youtu.be
+  if (host === "youtu.be" || host.endsWith("youtube.com")) {
+    let vid = "";
+    if (host === "youtu.be") {
+      vid = path.split("/").filter(Boolean)[0] || "";
+    } else {
+      if (path.startsWith("/watch")) vid = q.get("v") || "";
+      if (path.startsWith("/shorts/"))
+        vid = path.split("/").filter(Boolean)[1] || "";
     }
+    const appUrls = vid
+      ? [`vnd.youtube:${vid}`, `youtube://www.youtube.com/watch?v=${vid}`]
+      : [`youtube://`];
+    return { appUrls, packages: ["com.google.android.youtube"] };
+  }
 
-    const base = `https://${domain}`;
-    logCookieInfo(`Limpiando cookies para ${domain}`);
+  // X / Twitter
+  if (
+    host.endsWith("twitter.com") ||
+    host === "x.com" ||
+    host.endsWith(".x.com")
+  ) {
+    const parts = path.split("/").filter(Boolean);
+    let appUrls: string[] = ["twitter://timeline"];
+    if (parts.length >= 3 && parts[1].toLowerCase() === "status") {
+      const id = parts[2];
+      appUrls = [`twitter://status?status_id=${id}`, ...appUrls];
+    } else if (parts[0]) {
+      const user = parts[0];
+      appUrls = [`twitter://user?screen_name=${user}`, ...appUrls];
+    }
+    return { appUrls, packages: ["com.twitter.android"] };
+  }
 
-    const anyCM: any = CookieManager as any;
-    if (
-      typeof CookieManager.get === "function" &&
-      typeof anyCM.remove === "function"
-    ) {
+  // TikTok
+  if (host.endsWith("tiktok.com")) {
+    const parts = path.split("/").filter(Boolean);
+    const hasUser = parts[0]?.startsWith("@");
+    const user = hasUser ? parts[0] : "";
+    const appUrls = user
+      ? [
+          `snssdk1128://user/profile/${user}`,
+          `tiktok://user/${user}`,
+          `tiktok://`,
+        ]
+      : [`tiktok://`];
+    return { appUrls, packages: ["com.zhiliaoapp.musically"] };
+  }
+
+  return null;
+}
+
+// Abrir app primero; si falla, Play Store; si no, web del store
+async function openPreferInstalled(appUrls: string[], packages: string[]) {
+  for (const u of appUrls) {
+    try {
+      await Linking.openURL(u);
+      return true;
+    } catch {}
+  }
+  if (packages[0]) {
+    const market = `market://details?id=${packages[0]}`;
+    try {
+      await Linking.openURL(market);
+      return true;
+    } catch {}
+    const web = `https://play.google.com/store/apps/details?id=${packages[0]}`;
+    try {
+      await Linking.openURL(web);
+      return true;
+    } catch {}
+  }
+  Alert.alert("App no instalada", "Instala la aplicación para continuar.");
+  return false;
+}
+
+// ================= Injects =================
+const INJECT_MAIN = `
+  (function(){
+    try{
+      var m=document.querySelector('meta[name=viewport]');
+      if(!m){ m=document.createElement('meta');m.name='viewport';document.head.appendChild(m); }
+      m.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';
+      var s=document.createElement('style'); s.innerHTML='html{-webkit-text-size-adjust:100% !important;}'; document.head.appendChild(s);
+    }catch(e){}
+
+    // share → RN
+    var origShare = navigator.share;
+    navigator.share = function(data){
+      try{
+        var t=(data&&data.title)||''; var u=(data&&data.url)||'';
+        window.ReactNativeWebView && window.ReactNativeWebView.postMessage('RN_SHARE|'+encodeURIComponent(t)+'|'+encodeURIComponent(u));
+        return Promise.resolve();
+      }catch(e){ return Promise.reject(e); }
+    };
+
+    // Notificar URL actual (SPA-friendly) y enviar scroll en onscroll (throttle)
+    function post(msg){ try{ window.ReactNativeWebView && window.ReactNativeWebView.postMessage(msg); }catch(e){} }
+    function sendURL(){ post('URL|' + encodeURIComponent(location.href)); }
+    var last=0;
+    function onScroll(){
+      var now=Date.now();
+      if(now-last<250) return;
+      last=now;
+      var y = (window.pageYOffset||document.documentElement.scrollTop||document.body.scrollTop||0)|0;
+      post('SCROLL|' + encodeURIComponent(location.href) + '|' + y);
+    }
+    window.addEventListener('scroll', onScroll, {passive:true});
+    document.addEventListener('DOMContentLoaded', sendURL);
+    window.addEventListener('hashchange', sendURL);
+    // llamadas iniciales
+    sendURL();
+    post('PAGE_READY');
+  })(); true;
+`;
+
+const INJECT_PAY = `
+  (function(){
+    try{
+      var m=document.querySelector('meta[name=viewport]');
+      if(!m){ m=document.createElement('meta');m.name='viewport';document.head.appendChild(m); }
+      m.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';
+      var s=document.createElement('style'); s.innerHTML='html{-webkit-text-size-adjust:100% !important;}'; document.head.appendChild(s);
+    }catch(e){}
+    window.ReactNativeWebView && window.ReactNativeWebView.postMessage('PAYPHONE_READY');
+  })(); true;
+`;
+
+// ================= Cookies PayPhone (limpieza selectiva) =================
+async function clearPayCookies() {
+  const bases = [
+    "https://pay.payphonetodoesposible.com",
+    "https://www.payphonetodoesposible.com",
+    "https://payphonetodoesposible.com",
+  ];
+  try {
+    for (const base of bases) {
       const cookies = await CookieManager.get(base);
       for (const name of Object.keys(cookies || {})) {
         try {
-          await anyCM.remove(base, name);
-        } catch (error) {
-          logCookieInfo(`Error removiendo cookie ${name}:`, error);
-        }
+          await CookieManager.set(base, {
+            name,
+            value: "",
+            path: "/",
+            expires: "Thu, 01 Jan 1970 00:00:00 GMT",
+          });
+        } catch {}
       }
-      if (typeof CookieManager.flush === "function")
-        await CookieManager.flush();
-      return;
     }
-
-    // Fallback: clearAll (solo si es forzado)
-    if (typeof CookieManager.clearAll === "function") {
-      await CookieManager.clearAll(true);
-      if (typeof CookieManager.flush === "function")
-        await CookieManager.flush();
-    }
-  } catch (error) {
-    logCookieInfo(`Error limpiando cookies de ${domain}:`, error);
+    await CookieManager.flush?.();
+    log("Cookies PayPhone limpiadas");
+  } catch (e) {
+    log("Error limpiando cookies PayPhone", e);
   }
+}
+
+// ============== Modo inmersivo (sin superposición) ==============
+const ensureImmersive = async () => {
+  if (!IS_ANDROID) return;
+  try {
+    await NavigationBar.setBackgroundColorAsync("transparent");
+    await NavigationBar.setButtonStyleAsync("light");
+    // Clave: inset-swipe para que Android aplique insets cuando aparece la barra
+    await NavigationBar.setBehaviorAsync("inset-swipe");
+    await NavigationBar.setVisibilityAsync("hidden");
+  } catch {}
 };
 
+// ============== Helpers de persistencia de scroll/URL + LRU ==============
+const urlKey = (href: string) => {
+  try {
+    const u = new URL(href);
+    // sin hash, con search (para distinguir productos con queries)
+    return `${u.origin}${u.pathname}${u.search}`.toLowerCase();
+  } catch {
+    return href.toLowerCase();
+  }
+};
+const scrollKey = (href: string) => `${SCROLL_PREFIX}${urlKey(href)}`;
+
+async function getScrollIndex(): Promise<string[]> {
+  try {
+    const raw = await AsyncStorage.getItem(SCROLL_INDEX_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) return arr.filter((x) => typeof x === "string");
+    return [];
+  } catch {
+    return [];
+  }
+}
+async function setScrollIndex(arr: string[]) {
+  try {
+    await AsyncStorage.setItem(SCROLL_INDEX_KEY, JSON.stringify(arr));
+  } catch {}
+}
+
+async function removeFromScrollIndex(key: string) {
+  const idx = await getScrollIndex();
+  const i = idx.indexOf(key);
+  if (i >= 0) {
+    idx.splice(i, 1);
+    await setScrollIndex(idx);
+  }
+}
+
+async function touchScrollIndex(key: string) {
+  let idx = await getScrollIndex();
+  const i = idx.indexOf(key);
+  if (i >= 0) idx.splice(i, 1);
+  idx.unshift(key);
+  if (idx.length > MAX_SCROLL_ENTRIES) {
+    const toRemove = idx.slice(MAX_SCROLL_ENTRIES);
+    idx = idx.slice(0, MAX_SCROLL_ENTRIES);
+    try {
+      await AsyncStorage.multiRemove(toRemove);
+    } catch {}
+  }
+  await setScrollIndex(idx);
+}
+
+async function saveLastUrlIfKestore(href: string) {
+  if (href && isHttp(href) && isKestore(href)) {
+    await AsyncStorage.setItem(LAST_URL_KEY, href).catch(() => {});
+  }
+}
+
+async function saveScroll(href: string, y: number) {
+  if (!href || !isHttp(href) || !isKestore(href)) return;
+  const key = scrollKey(href);
+  if (y > 0) {
+    await AsyncStorage.setItem(key, String(Math.max(0, y | 0))).catch(() => {});
+    await touchScrollIndex(key);
+  } else {
+    // si vuelve al top, limpiamos la entrada y la sacamos del índice
+    await AsyncStorage.removeItem(key).catch(() => {});
+    await removeFromScrollIndex(key);
+  }
+}
+
+// ejecuta varios intentos de scrollTo para asegurar que el DOM ya está listo
+function injectScrollTo(webRef: React.RefObject<WebView>, y: number) {
+  if (!webRef.current || !(y > 0)) return;
+  const js = `
+    (function(){
+      var y=${y | 0};
+      var tries=0;
+      var id=setInterval(function(){
+        try{ window.scrollTo(0, y); }catch(e){}
+        if(++tries>=6){ clearInterval(id); }
+      }, 80);
+    })(); true;
+  `;
+  webRef.current.injectJavaScript(js);
+}
+
+// =============== App ======================
 export default function App() {
   const webRef = useRef<WebView>(null);
   const payRef = useRef<WebView>(null);
 
-  const [mainUrl, setMainUrl] = useState(HOME_URL);
+  const [mainUrl, setMainUrl] = useState<string | null>(null); // evita flash del home
   const [payVisible, setPayVisible] = useState(false);
   const [payUrl, setPayUrl] = useState<string | null>(null);
-  const [isPaymentInProgress, setIsPaymentInProgress] = useState(false);
 
-  const topInset = useMemo(
-    () => (IS_ANDROID ? (StatusBar.currentHeight ?? 24) : 0),
-    []
-  );
+  // última URL real de la principal (para Referer)
+  const lastMainUrlRef = useRef<string>(HOME_URL);
+  // bypass una vez para permitir que la principal navegue a PayPhone si hace falta
+  const bypassNextPayInterceptRef = useRef<boolean>(false);
+  const initialPayUrlRef = useRef<string | null>(null);
 
-  const injectedMain = useMemo(
-    () => `
-      (function(){
-        try{
-          // Configuración de viewport
-          var m=document.querySelector('meta[name=viewport]');
-          if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}
-          m.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';
-          var s=document.createElement('style');s.innerHTML='html{-webkit-text-size-adjust:100% !important;}';document.head.appendChild(s);
-          
-          // Configuración de cookies para terceros
-          if (document.cookie) {
-            document.cookie.split(';').forEach(function(cookie) {
-              var eqPos = cookie.indexOf('=');
-              var name = eqPos > -1 ? cookie.substr(0, eqPos).trim() : cookie.trim();
-              if (name) {
-                document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; domain=.' + window.location.hostname + '; SameSite=None; Secure';
-              }
-            });
-          }
-        }catch(e){
-          console.log('Error en configuración inicial:', e);
-        }
-        
-        // Override del navigator.share
-        var origShare=navigator.share;
-        navigator.share=function(data){
-          try{
-            var title=(data&&data.title)||'';
-            var url=(data&&data.url)||'';
-            window.ReactNativeWebView && window.ReactNativeWebView.postMessage('RN_SHARE|'+encodeURIComponent(title)+'|'+encodeURIComponent(url));
-            return Promise.resolve();
-          }catch(e){return Promise.reject(e);}
-        };
-        
-        // Notificar que la página está lista
-        window.ReactNativeWebView && window.ReactNativeWebView.postMessage('PAGE_READY');
-      })(); true;
-    `,
-    []
-  );
-
-  const injectedPay = useMemo(
-    () => `
-      (function(){
-        try{
-          // Configuración de viewport para PayPhone
-          var m=document.querySelector('meta[name=viewport]');
-          if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}
-          m.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';
-          var s=document.createElement('style');s.innerHTML='html{-webkit-text-size-adjust:100% !important;}';document.head.appendChild(s);
-          
-          // Configuración específica para PayPhone
-          // Asegurar que las cookies se manejen correctamente
-          if (typeof Storage !== 'undefined') {
-            // Preservar sessionStorage y localStorage para PayPhone
-            window.addEventListener('beforeunload', function() {
-              // Mantener datos de sesión
-            });
-          }
-          
-          // Notificar estado de PayPhone
-          window.ReactNativeWebView && window.ReactNativeWebView.postMessage('PAYPHONE_READY');
-          
-        }catch(e){
-          console.log('Error en configuración PayPhone:', e);
-          window.ReactNativeWebView && window.ReactNativeWebView.postMessage('PAYPHONE_ERROR|' + e.message);
-        }
-      })(); true;
-    `,
-    []
-  );
-
-  // Diagnóstico específico para el error "no autorizado"
-  const diagnosePayPhoneIssue = useCallback(async () => {
-    logCookieInfo("🔬 Iniciando diagnóstico de PayPhone...");
-
-    try {
-      // 1. Verificar cookies existentes
-      for (const host of PAY_HOSTS) {
-        const url = `https://${host}`;
-        const cookies = await CookieManager.get(url);
-        const cookieCount = cookies ? Object.keys(cookies).length : 0;
-
-        if (cookieCount > 0) {
-          logCookieInfo(
-            `🍪 ${host}: ${cookieCount} cookies encontradas`,
-            cookies
-          );
-
-          // Verificar si hay cookies de sesión específicas
-          const sessionCookies = Object.keys(cookies).filter(
-            (name) =>
-              name.toLowerCase().includes("session") ||
-              name.toLowerCase().includes("auth") ||
-              name.toLowerCase().includes("token")
-          );
-
-          if (sessionCookies.length > 0) {
-            logCookieInfo(
-              `🔑 Cookies de sesión encontradas: ${sessionCookies.join(", ")}`
-            );
-          } else {
-            logCookieInfo(
-              `⚠️ No se encontraron cookies de sesión para ${host}`
-            );
-          }
-        } else {
-          logCookieInfo(
-            `❌ No hay cookies para ${host} - POSIBLE CAUSA DEL ERROR`
-          );
-        }
-      }
-
-      // 2. Verificar AsyncStorage
-      const savedCookies = await AsyncStorage.getItem(PAYPHONE_COOKIE_KEY);
-      if (savedCookies) {
-        const parsed = JSON.parse(savedCookies);
-        logCookieInfo("💾 Cookies guardadas en AsyncStorage:", parsed);
-      } else {
-        logCookieInfo("📭 No hay cookies guardadas en AsyncStorage");
-      }
-    } catch (error) {
-      logCookieInfo("❌ Error en diagnóstico:", error);
-    }
+  // inmersivo al montar y al volver al foreground
+  useEffect(() => {
+    ensureImmersive();
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s === "active") ensureImmersive();
+    });
+    return () => sub.remove();
   }, []);
 
-  // Solución robusta para el error "no autorizado"
-  const preparePayPhoneRobust = useCallback(async () => {
-    logCookieInfo("🚀 Preparación robusta de PayPhone iniciada...");
-
-    try {
-      // 1. Limpiar cookies potencialmente corruptas
-      logCookieInfo("🧹 Limpiando cookies potencialmente corruptas...");
-      await clearDomainCookies("pay.payphonetodoesposible.com", true);
-      await clearDomainCookies("payphonetodoesposible.com", true);
-      await AsyncStorage.removeItem(PAYPHONE_COOKIE_KEY);
-
-      // 2. Pre-autenticación para establecer cookies válidas
-      logCookieInfo("🔐 Iniciando pre-autenticación con PayPhone...");
-
+  // Restaurar URL al iniciar: primero deep link, luego última vista, luego HOME
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
       try {
-        const response = await fetch("https://pay.payphonetodoesposible.com/", {
-          method: "GET",
-          credentials: "include",
-          headers: {
-            "User-Agent": UA,
-            Accept:
-              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            Pragma: "no-cache",
-          },
-        });
-
-        if (response.ok) {
-          logCookieInfo("✅ Pre-autenticación exitosa");
-
-          // Verificar que se establecieron cookies
-          const newCookies = await CookieManager.get(
-            "https://pay.payphonetodoesposible.com"
-          );
-          const cookieCount = newCookies ? Object.keys(newCookies).length : 0;
-
-          if (cookieCount > 0) {
-            logCookieInfo(
-              `🍪 ${cookieCount} cookies establecidas después de pre-auth:`,
-              newCookies
-            );
-
-            // Guardar las nuevas cookies
-            await savePayPhoneCookies();
-          } else {
-            logCookieInfo("⚠️ No se establecieron cookies después de pre-auth");
-          }
-        } else {
-          logCookieInfo(
-            `⚠️ Pre-autenticación falló: ${response.status} ${response.statusText}`
-          );
+        const initialIntent = await Linking.getInitialURL();
+        if (
+          initialIntent &&
+          isHttp(initialIntent) &&
+          isKestore(initialIntent)
+        ) {
+          if (mounted) setMainUrl(initialIntent);
+          return;
         }
-      } catch (fetchError) {
-        logCookieInfo("❌ Error en pre-autenticación:", fetchError);
-        // Continuar de todos modos, tal vez PayPhone funcione sin pre-auth
-      }
-
-      // 3. Pequeña pausa para asegurar que las cookies se establezcan
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      logCookieInfo("🎯 Preparación robusta completada");
-    } catch (error) {
-      logCookieInfo("❌ Error en preparación robusta:", error);
-    }
-  }, []);
-
-  // Solución específica para Android WebView
-  const preparePayPhoneForAndroid = useCallback(async () => {
-    logCookieInfo("🤖 Preparación específica para Android WebView iniciada...");
-
-    try {
-      // 1. Limpiar estado anterior completamente
-      logCookieInfo("🧹 Limpieza completa del estado anterior...");
-      await clearDomainCookies("pay.payphonetodoesposible.com", true);
-      await clearDomainCookies("payphonetodoesposible.com", true);
-      await clearDomainCookies("www.payphonetodoesposible.com", true);
-      await AsyncStorage.removeItem(PAYPHONE_COOKIE_KEY);
-
-      // 2. Simular comportamiento de navegador web completo
-      logCookieInfo("🌐 Simulando comportamiento de navegador web...");
-
-      const browserHeaders = {
-        "User-Agent": UA,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        DNT: "1",
-        Connection: "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-        Pragma: "no-cache",
-      };
-
-      try {
-        logCookieInfo("📡 Realizando petición inicial a PayPhone...");
-        const response = await fetch("https://pay.payphonetodoesposible.com/", {
-          method: "GET",
-          credentials: "include",
-          headers: browserHeaders,
-        });
-
-        logCookieInfo(
-          `📊 Respuesta: ${response.status} ${response.statusText}`
-        );
-
-        if (response.ok) {
-          // Verificar cookies obtenidas
-          const cookies = await CookieManager.get(
-            "https://pay.payphonetodoesposible.com"
-          );
-          const cookieCount = cookies ? Object.keys(cookies).length : 0;
-
-          if (cookieCount > 0) {
-            logCookieInfo(
-              `✅ ${cookieCount} cookies obtenidas automáticamente:`,
-              cookies
-            );
-            await savePayPhoneCookies();
-          } else {
-            logCookieInfo(
-              "⚠️ No se obtuvieron cookies automáticamente, estableciendo manualmente..."
-            );
-
-            // Establecer cookies básicas que PayPhone necesita
-            const essentialCookies = [
-              {
-                name: "PHPSESSID",
-                value: `android_session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                domain: "pay.payphonetodoesposible.com",
-                path: "/",
-                httpOnly: false,
-                secure: true,
-              },
-              {
-                name: "device_info",
-                value: "mobile_android",
-                domain: "pay.payphonetodoesposible.com",
-                path: "/",
-                httpOnly: false,
-                secure: true,
-              },
-              {
-                name: "user_agent_hash",
-                value: btoa(UA).substr(0, 16),
-                domain: "pay.payphonetodoesposible.com",
-                path: "/",
-                httpOnly: false,
-                secure: true,
-              },
-            ];
-
-            for (const cookie of essentialCookies) {
-              try {
-                await CookieManager.set(
-                  "https://pay.payphonetodoesposible.com",
-                  {
-                    name: cookie.name,
-                    value: cookie.value,
-                    domain: cookie.domain,
-                    path: cookie.path,
-                    version: "1",
-                    expires: new Date(
-                      Date.now() + 24 * 60 * 60 * 1000
-                    ).toUTCString(),
-                  }
-                );
-                logCookieInfo(`🍪 Cookie esencial establecida: ${cookie.name}`);
-              } catch (cookieError) {
-                logCookieInfo(
-                  `❌ Error estableciendo ${cookie.name}:`,
-                  cookieError
-                );
-              }
-            }
-          }
-        } else {
-          logCookieInfo(
-            `⚠️ Respuesta no exitosa: ${response.status} - ${response.statusText}`
-          );
+        const saved = await AsyncStorage.getItem(LAST_URL_KEY);
+        if (saved && isHttp(saved) && isKestore(saved)) {
+          if (mounted) setMainUrl(saved);
+          return;
         }
-      } catch (fetchError) {
-        logCookieInfo("❌ Error en petición inicial:", fetchError);
+        if (mounted) setMainUrl(HOME_URL);
+      } catch {
+        if (mounted) setMainUrl(HOME_URL);
       }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
-      // 3. Pausa para sincronización
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+  const openExternal = useCallback((url: string) => {
+    Linking.openURL(url).catch(() => {});
+  }, []);
 
-      // 4. Verificación final y guardado
-      const finalCookies = await CookieManager.get(
-        "https://pay.payphonetodoesposible.com"
-      );
-      const finalCount = finalCookies ? Object.keys(finalCookies).length : 0;
+  // Mensajes desde el WebView principal
+  const onMainMessage = useCallback(async (e: WebViewMessageEvent) => {
+    const raw = String(e?.nativeEvent?.data || "");
+    if (!raw) return;
 
-      if (finalCount > 0) {
-        logCookieInfo(
-          `🎯 Android WebView preparado con ${finalCount} cookies:`,
-          finalCookies
+    if (raw.startsWith("RN_SHARE|")) {
+      const parts = raw.split("|");
+      const title = decodeURIComponent(parts[1] || "");
+      const url = decodeURIComponent(parts[2] || "");
+      shareDebounced(title, url);
+      return;
+    }
+
+    if (raw === "PAGE_READY") {
+      log("Página principal lista");
+      return;
+    }
+
+    if (raw.startsWith("URL|")) {
+      const href = decodeURIComponent(raw.slice(4));
+      if (href && isHttp(href) && isKestore(href)) {
+        // Guardar última URL
+        await saveLastUrlIfKestore(href);
+        // Restaurar scroll si existe
+        const yStr = await AsyncStorage.getItem(scrollKey(href)).catch(
+          () => null
         );
-        await savePayPhoneCookies();
-      } else {
-        logCookieInfo(
-          "⚠️ No se pudieron establecer cookies - PayPhone podría fallar"
-        );
+        const y = yStr ? parseInt(yStr, 10) : 0;
+        if (y > 0) {
+          injectScrollTo(webRef, y);
+        }
       }
-    } catch (error) {
-      logCookieInfo("❌ Error crítico en preparación Android:", error);
+      return;
+    }
+
+    if (raw.startsWith("SCROLL|")) {
+      // SCROLL|<href>|<y>
+      const rest = raw.slice(7);
+      const firstSep = rest.indexOf("|");
+      if (firstSep > 0) {
+        const href = decodeURIComponent(rest.slice(0, firstSep));
+        const y = parseInt(rest.slice(firstSep + 1), 10) || 0;
+        void saveScroll(href, y);
+      }
+      return;
     }
   }, []);
 
-  // Manejo mejorado de cookies para PayPhone
-  const preparePayPhoneSession = useCallback(async () => {
-    try {
-      logCookieInfo("🚀 Preparando sesión de PayPhone para Android...");
-
-      // Usar preparación específica para Android WebView
-      await preparePayPhoneForAndroid();
-
-      // Hacer diagnóstico después de la preparación
-      await diagnosePayPhoneIssue();
-
-      // Restaurar cookies guardadas si existen (después de la preparación Android)
-      await restorePayPhoneCookies();
-
-      setIsPaymentInProgress(true);
-      logCookieInfo(
-        "✅ Sesión de PayPhone preparada específicamente para Android"
-      );
-    } catch (error) {
-      logCookieInfo("❌ Error preparando sesión PayPhone:", error);
-    }
-  }, [preparePayPhoneForAndroid, diagnosePayPhoneIssue]);
-
-  const cleanupPayPhoneSession = useCallback(async (force = false) => {
-    try {
-      logCookieInfo("Limpiando sesión de PayPhone...", { force });
-      if (force) {
-        // Solo limpiar si es forzado (error o cancelación)
-        await clearDomainCookies("pay.payphonetodoesposible.com", true);
-        await clearDomainCookies("payphonetodoesposible.com", true);
-        await AsyncStorage.removeItem(PAYPHONE_COOKIE_KEY);
-      }
-      await CookieManager.flush();
-      setIsPaymentInProgress(false);
-    } catch (error) {
-      logCookieInfo("Error limpiando sesión PayPhone:", error);
-    }
-  }, []);
-
-  const gotoHomeWithTag = useCallback(
-    (tag: string) => {
-      const target = `${HOME_URL}#${tag}`;
-      logCookieInfo(`Regresando a home con tag: ${tag}`);
-
-      // Guardar cookies antes de cerrar PayPhone si el pago fue exitoso
-      if (tag.includes("success")) {
-        savePayPhoneCookies();
-      }
-
-      setPayVisible(false);
-      setPayUrl(null);
-
-      // Solo limpiar si hay error o cancelación
-      const shouldForceClean =
-        tag.includes("cancel") ||
-        tag.includes("expired") ||
-        tag.includes("error");
-      cleanupPayPhoneSession(shouldForceClean);
-
-      setTimeout(() => setMainUrl(target), 100);
-    },
-    [cleanupPayPhoneSession]
-  );
-
-  const handlePayOutcomeByUrl = useCallback(
-    (url: string) => {
-      logCookieInfo(`🔍 Analizando URL de PayPhone: ${url}`);
-
-      let u: URL | null = null;
-      try {
-        u = new URL(url);
-      } catch (error) {
-        logCookieInfo(`❌ Error parseando URL: ${url}`, error);
-        return false;
-      }
-
-      const path = (u?.pathname || "") + (u?.search || "") + (u?.hash || "");
-      const p = path.toLowerCase();
-
-      logCookieInfo(`📍 Path analizado: ${path}`);
-      logCookieInfo(
-        `🔍 Host: ${u.host}, Path: ${u.pathname}, Search: ${u.search}`
-      );
-
-      // Verificar éxito
-      const successKey = PAY_SUCCESS_KEYS.find((k) => p.includes(k));
-      if (successKey) {
-        logCookieInfo(`✅ Pago exitoso detectado con clave: ${successKey}`);
-        gotoHomeWithTag("pay=success");
-        return true;
-      }
-
-      // Verificar cancelación
-      const cancelKey = PAY_CANCEL_KEYS.find((k) => p.includes(k));
-      if (cancelKey) {
-        logCookieInfo(`❌ Pago cancelado detectado con clave: ${cancelKey}`);
-        gotoHomeWithTag("pay=cancel");
-        return true;
-      }
-
-      // Verificar errores específicos
-      const errorKey = PAY_ERROR_KEYS.find((k) => p.includes(k));
-      const isExpired = /\/home\/expired/.test(p) || /\/expired/.test(p);
-      const isUnauthorized = /unauthorized|no%20autorizado/.test(p);
-
-      if (errorKey || isExpired || isUnauthorized) {
-        if (errorKey)
-          logCookieInfo(`🚨 Error detectado con clave: ${errorKey}`);
-        if (isExpired) logCookieInfo(`⏰ Sesión expirada detectada`);
-        if (isUnauthorized)
-          logCookieInfo(
-            `🔒 Error "no autorizado" detectado - PROBLEMA DE COOKIES`
-          );
-
-        logCookieInfo(`🚨 URL completa del error: ${url}`);
-        gotoHomeWithTag("pay=expired");
-        return true;
-      }
-
-      logCookieInfo(`⚠️ URL sin patrón reconocido, continuando navegación`);
-      return false;
-    },
-    [gotoHomeWithTag]
-  );
-
-  const openExternal = useCallback(async (url: string) => {
-    try {
-      if (await Linking.canOpenURL(url)) await Linking.openURL(url);
-    } catch {}
-  }, []);
-
-  const onShouldStart = useCallback(
-    (req: any) => {
+  // Intercepta navegación principal (SIN async → boolean)
+  const onMainShouldStart = useCallback(
+    (req: any): boolean => {
       const { url, navigationType } = req as {
         url: string;
         navigationType?: string;
       };
       const host = hostOf(url);
+      log("Main shouldStart", { url, navigationType, host });
 
-      logCookieInfo(`onShouldStart: ${url}`, { navigationType, host });
-
-      if (!isHttp(url) && !isSocialScheme(url)) return false;
-
-      if (isSocialScheme(url)) {
+      // Schemes directos
+      if (!isHttp(url) && isSocialScheme(url)) {
         openExternal(url);
         return false;
       }
+      if (!isHttp(url)) return false;
 
+      // HTTPS sociales → abrir app primero
+      const social = mapSocialToApp(url);
+      if (social) {
+        setTimeout(() => {
+          void openPreferInstalled(social.appUrls, social.packages);
+        }, 0);
+        return false;
+      }
+
+      // PayPhone en principal → abrir modal
       if (isPayHost(host)) {
-        logCookieInfo("Detectado host de PayPhone, preparando sesión...");
-        preparePayPhoneSession();
+        if (bypassNextPayInterceptRef.current) {
+          log("Bypass intercept PayPhone → permitir en principal");
+          bypassNextPayInterceptRef.current = false;
+          return true;
+        }
+        initialPayUrlRef.current = url;
         setPayUrl(url);
         setPayVisible(true);
         return false;
       }
 
+      // Share pseudo-scheme
       if (looksLikeShareIntent(url)) {
         try {
           const decoded = decodeURIComponent(url.replace(/^share:/i, ""));
-          shareDebounced(undefined, decoded);
-        } catch (error) {
-          logCookieInfo("Error en share intent:", error);
-        }
+          setTimeout(() => {
+            Share.share({ message: decoded }).catch(() => {});
+          }, 0);
+        } catch {}
         return false;
       }
 
       if (isKestore(url)) return true;
-
       if (navigationType === "click") {
         openExternal(url);
         return false;
       }
-
       return true;
     },
-    [openExternal, preparePayPhoneSession]
+    [openExternal]
   );
 
+  // Cambios de navegación principal
+  const onMainNavChange = useCallback((nav: any) => {
+    const url = String(nav?.url || "");
+    lastMainUrlRef.current = url || lastMainUrlRef.current;
+    log("Main navChange", { url, loading: nav?.loading });
+
+    // Persistir última URL de Kestore
+    if (url && isHttp(url) && isKestore(url)) {
+      AsyncStorage.setItem(LAST_URL_KEY, url).catch(() => {});
+    }
+
+    if (isPayHost(hostOf(url))) bypassNextPayInterceptRef.current = false;
+    ensureImmersive();
+  }, []);
+
+  // Botón back físico
   useEffect(() => {
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
       if (payVisible) {
-        logCookieInfo("Back button presionado en PayPhone, cancelando pago...");
+        log("Back en PayPhone → cerrar y limpiar cookies PayPhone");
         setPayVisible(false);
         setPayUrl(null);
-        // Limpiar cookies al cancelar manualmente
-        cleanupPayPhoneSession(true);
+        clearPayCookies();
+        setTimeout(ensureImmersive, 0);
         return true;
       }
       try {
         webRef.current?.injectJavaScript("history.back(); true;");
+        setTimeout(ensureImmersive, 0);
         return true;
-      } catch (error) {
-        logCookieInfo("Error en back navigation:", error);
+      } catch {
         return false;
       }
     });
     return () => sub.remove();
-  }, [payVisible, cleanupPayPhoneSession]);
+  }, [payVisible]);
 
-  const onMessage = useCallback((event: WebViewMessageEvent) => {
-    const data = String(event?.nativeEvent?.data || "");
-    logCookieInfo("Mensaje recibido del WebView:", data);
+  // ====== PayPhone (modal) ======
+  const onPayShouldStart = useCallback(
+    (req: any): boolean => {
+      const { url } = req as { url: string };
+      const host = hostOf(url);
+      const path = pathOf(url);
+      log("Pay shouldStart", { url, host, path });
 
-    if (data.startsWith("RN_SHARE|")) {
-      const parts = data.split("|");
-      const title = decodeURIComponent(parts[1] || "");
-      const url = decodeURIComponent(parts[2] || "");
-      shareDebounced(title, url);
-    } else if (data === "PAGE_READY") {
-      logCookieInfo("Página principal lista");
-    } else if (data === "PAYPHONE_READY") {
-      logCookieInfo("PayPhone WebView listo");
-    } else if (data.startsWith("PAYPHONE_ERROR|")) {
-      const error = data.replace("PAYPHONE_ERROR|", "");
-      logCookieInfo("Error en PayPhone:", error);
-      if (__DEV__) {
-        Alert.alert("Error PayPhone", error);
+      if (!isHttp(url) && isSocialScheme(url)) {
+        openExternal(url);
+        return false;
       }
+      if (!isHttp(url)) return false;
+
+      const social = mapSocialToApp(url);
+      if (social) {
+        setTimeout(() => {
+          void openPreferInstalled(social.appUrls, social.packages);
+        }, 0);
+        return false;
+      }
+
+      if (isPayHost(host)) return true;
+
+      // Salir de PayPhone → a principal
+      log("Saliendo de PayPhone → cerrar modal y navegar principal", url);
+      setPayVisible(false);
+      setPayUrl(null);
+      setMainUrl(url);
+      setTimeout(ensureImmersive, 0);
+      return false;
+    },
+    [openExternal]
+  );
+
+  const onPayNavChange = useCallback((nav: any) => {
+    const url = String(nav?.url || "");
+    const p = (url || "").toLowerCase();
+    log("Pay navChange", { url });
+    if (PAY_ERR_KEYS.some((k) => p.includes(k))) {
+      log("PayPhone: NO AUTORIZADO/ERROR → fallback a principal con Referer");
+      const target = initialPayUrlRef.current || url;
+      setPayVisible(false);
+      setPayUrl(null);
+      bypassNextPayInterceptRef.current = true;
+      const js = `
+        (function(){ try { window.location.href = ${JSON.stringify(
+          target
+        )}; } catch(e){} })(); true;
+      `;
+      webRef.current?.injectJavaScript(js);
+      setTimeout(ensureImmersive, 0);
     }
   }, []);
 
-  const onPayNavChange = useCallback(
-    (nav: WebViewNavigation) => {
-      const url = String(nav?.url || "");
-      logCookieInfo("PayPhone navegación cambió:", {
-        url,
-        canGoBack: nav.canGoBack,
-        loading: nav.loading,
-      });
-      if (url) {
-        handlePayOutcomeByUrl(url);
-      }
-    },
-    [handlePayOutcomeByUrl]
-  );
+  const onPayMessage = useCallback((e: WebViewMessageEvent) => {
+    const data = String(e?.nativeEvent?.data || "");
+    if (data === "PAYPHONE_READY") log("PayPhone listo");
+  }, []);
 
+  // ============== Render ==============
   return (
-    <SafeAreaView style={[styles.container, { paddingTop: topInset }]}>
+    <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <StatusBar
         translucent
         backgroundColor="transparent"
@@ -806,132 +671,84 @@ export default function App() {
       />
 
       {/* WEBVIEW PRINCIPAL */}
-      <WebView
-        ref={webRef}
-        source={{ uri: mainUrl }}
-        userAgent={UA}
-        originWhitelist={["*"]}
-        javaScriptEnabled={true}
-        domStorageEnabled={true}
-        cacheEnabled={true}
-        allowFileAccess={false}
-        allowsInlineMediaPlayback={true}
-        mediaPlaybackRequiresUserAction={false}
-        setBuiltInZoomControls={false}
-        setDisplayZoomControls={false}
-        thirdPartyCookiesEnabled={true}
-        sharedCookiesEnabled={true}
-        setSupportMultipleWindows={false}
-        textZoom={100}
-        mixedContentMode="compatibility"
-        allowsProtectedMedia={true}
-        injectedJavaScript={injectedMain}
-        onMessage={onMessage}
-        onShouldStartLoadWithRequest={onShouldStart}
-        onNavigationStateChange={(nav) => {
-          const url = String(nav?.url || "");
-          logCookieInfo("Main WebView navegación:", {
-            url,
-            loading: nav.loading,
-          });
-          if (url && isPayHost(hostOf(url))) {
-            logCookieInfo(
-              "Detectado PayPhone en main WebView, redirigiendo..."
-            );
-            preparePayPhoneSession();
-            setPayUrl(url);
-            setPayVisible(true);
-          }
-        }}
-        onError={(syntheticEvent) => {
-          const { nativeEvent } = syntheticEvent;
-          logCookieInfo("Error en main WebView:", nativeEvent);
-        }}
-        onHttpError={(syntheticEvent) => {
-          const { nativeEvent } = syntheticEvent;
-          logCookieInfo("HTTP Error en main WebView:", nativeEvent);
-        }}
-        startInLoadingState={true}
-        style={styles.web}
-      />
+      {!mainUrl ? (
+        <View style={{ flex: 1, backgroundColor: "#000" }} />
+      ) : (
+        <WebView
+          ref={webRef}
+          source={{ uri: mainUrl }}
+          userAgent={UA}
+          originWhitelist={["*"]}
+          javaScriptEnabled
+          domStorageEnabled
+          cacheEnabled
+          allowFileAccess={false}
+          allowsInlineMediaPlayback
+          mediaPlaybackRequiresUserAction={false}
+          setBuiltInZoomControls={false}
+          setDisplayZoomControls={false}
+          thirdPartyCookiesEnabled
+          sharedCookiesEnabled
+          setSupportMultipleWindows={false}
+          textZoom={100}
+          mixedContentMode="compatibility"
+          injectedJavaScript={INJECT_MAIN}
+          onMessage={onMainMessage}
+          onShouldStartLoadWithRequest={onMainShouldStart}
+          onNavigationStateChange={onMainNavChange}
+          onError={(e) => log("Main WebView error", e.nativeEvent)}
+          onHttpError={(e) => log("Main WebView HTTP error", e.nativeEvent)}
+          startInLoadingState
+          style={styles.web}
+        />
+      )}
 
       {/* MODAL PayPhone */}
       {payVisible && (
         <View style={styles.modal}>
           <WebView
             ref={payRef}
-            source={{ uri: payUrl || "about:blank" }}
+            source={{
+              uri: payUrl || "about:blank",
+              headers: {
+                Referer: lastMainUrlRef.current || HOME_URL,
+                Origin: lastMainUrlRef.current?.startsWith("https://")
+                  ? new URL(lastMainUrlRef.current).origin
+                  : "https://www.kestore.com.ec",
+              },
+            }}
             userAgent={UA}
             originWhitelist={["*"]}
-            javaScriptEnabled={true}
-            domStorageEnabled={true}
-            cacheEnabled={true} // Habilitado para simular navegador web
+            javaScriptEnabled
+            domStorageEnabled
+            cacheEnabled
             allowFileAccess={false}
-            allowsInlineMediaPlayback={true}
+            allowsInlineMediaPlayback
             mediaPlaybackRequiresUserAction={false}
-            thirdPartyCookiesEnabled={true}
-            sharedCookiesEnabled={true}
+            thirdPartyCookiesEnabled
+            sharedCookiesEnabled
             setBuiltInZoomControls={false}
             setDisplayZoomControls={false}
             setSupportMultipleWindows={false}
             textZoom={100}
             mixedContentMode="compatibility"
-            allowsProtectedMedia={true}
-            // Configuraciones específicas para Android WebView como navegador
-            incognito={false} // Importante: mantener cookies
-            allowsBackForwardNavigationGestures={true}
-            bounces={false}
-            overScrollMode="never"
-            scrollEnabled={true}
-            showsHorizontalScrollIndicator={false}
-            showsVerticalScrollIndicator={false}
-            // Configuraciones adicionales para compatibilidad con PayPhone
             androidLayerType="hardware"
-            injectedJavaScript={injectedPay}
+            injectedJavaScript={INJECT_PAY}
+            onMessage={onPayMessage}
+            onShouldStartLoadWithRequest={onPayShouldStart}
             onNavigationStateChange={onPayNavChange}
-            onShouldStartLoadWithRequest={(req: any) => {
-              const { url } = req;
-              const host = hostOf(url);
-
-              logCookieInfo("PayPhone onShouldStart:", { url, host });
-
-              if (isSocialScheme(url)) {
-                openExternal(url);
-                return false;
-              }
-
-              if (isPayHost(host)) {
-                // Permitir navegación dentro de PayPhone
-                return true;
-              }
-
-              // Salir del dominio de PayPhone → regresar al principal
-              if (!isPayHost(host)) {
-                logCookieInfo("Saliendo de PayPhone hacia:", url);
-                setPayVisible(false);
-                setPayUrl(null);
-                cleanupPayPhoneSession(false); // No forzar limpieza
-                setMainUrl(url);
-                return false;
-              }
-
-              return true;
-            }}
-            onError={(syntheticEvent) => {
-              const { nativeEvent } = syntheticEvent;
-              logCookieInfo("Error en PayPhone WebView:", nativeEvent);
-              if (__DEV__) {
+            onError={(e) => {
+              log("PayPhone WebView error", e.nativeEvent);
+              if (__DEV__)
                 Alert.alert(
-                  "Error PayPhone",
-                  `Error de conexión: ${nativeEvent.description}`
+                  "PayPhone",
+                  `Error de conexión: ${e.nativeEvent.description}`
                 );
-              }
             }}
-            onHttpError={(syntheticEvent) => {
-              const { nativeEvent } = syntheticEvent;
-              logCookieInfo("HTTP Error en PayPhone WebView:", nativeEvent);
-            }}
-            startInLoadingState={true}
+            onHttpError={(e) =>
+              log("PayPhone WebView HTTP error", e.nativeEvent)
+            }
+            startInLoadingState
             style={styles.web}
           />
         </View>
