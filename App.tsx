@@ -1,6 +1,7 @@
 // App.tsx — Android
 // PayPhone OK + Deep Links sociales + Modo inmersivo (inset) +
 // Persistencia de última URL y posición de scroll con LRU (restauración al reabrir)
+// Mejoras: Manejo de estado de app, Google Auth, SSL, y estabilidad general
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -13,12 +14,23 @@ import {
   StyleSheet,
   View,
   Alert,
+  AppStateStatus,
 } from "react-native";
 import { WebView, WebViewMessageEvent } from "react-native-webview";
 import CookieManager from "@react-native-cookies/cookies";
 import * as NavigationBar from "expo-navigation-bar";
 import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as SplashScreen from "expo-splash-screen";
+import NetInfo from "@react-native-community/netinfo";
+import {
+  isSSLError,
+  isNetworkError,
+  showUserFriendlyError,
+  ERROR_TYPES,
+  logWithContext,
+  clearAppCache,
+} from "./src/utils/AppUtils";
 
 const IS_ANDROID = Platform.OS === "android";
 
@@ -35,9 +47,9 @@ const PAY_ERR_KEYS = [
   "/expired",
 ];
 
-// UA móvil realista
+// UA móvil realista - Actualizado para mejor compatibilidad con Google Auth
 const UA =
-  "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36";
+  "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36 KeApp/1.0.9";
 
 // ================= Persistencia =================
 const LAST_URL_KEY = "@kestore_last_url";
@@ -46,8 +58,19 @@ const SCROLL_INDEX_KEY = "@kestore_scroll_index"; // índice LRU
 const MAX_SCROLL_ENTRIES = 30; // tope LRU
 
 // ================= Utils ===================
-const log = (msg: string, extra?: any) =>
-  console.log(`[${new Date().toISOString()}] [APP] ${msg}`, extra ?? "");
+const log = (msg: string, extra?: any) => {
+  if (__DEV__) {
+    logWithContext(`[APP] ${msg}`, extra);
+  } else {
+    // En producción, solo log errores críticos
+    if (
+      msg.toLowerCase().includes("error") ||
+      msg.toLowerCase().includes("fail")
+    ) {
+      logWithContext(`[APP] ${msg}`, extra);
+    }
+  }
+};
 
 const isHttp = (u: string) => /^https?:\/\//i.test(u);
 const hostOf = (u: string) => {
@@ -226,7 +249,29 @@ const INJECT_MAIN = `
       var m=document.querySelector('meta[name=viewport]');
       if(!m){ m=document.createElement('meta');m.name='viewport';document.head.appendChild(m); }
       m.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';
-      var s=document.createElement('style'); s.innerHTML='html{-webkit-text-size-adjust:100% !important;}'; document.head.appendChild(s);
+      var s=document.createElement('style'); 
+      s.innerHTML='html{-webkit-text-size-adjust:100% !important;} body{-webkit-touch-callout:none;-webkit-user-select:none;}'; 
+      document.head.appendChild(s);
+    }catch(e){}
+
+    // Mejorar compatibilidad con Google Auth
+    try{
+      // Asegurar que window.open funcione correctamente
+      var originalOpen = window.open;
+      window.open = function(url, target, features) {
+        if (url && url.includes('accounts.google.com')) {
+          // Para Google Auth, usar la ventana actual
+          window.location.href = url;
+          return window;
+        }
+        return originalOpen.call(this, url, target, features);
+      };
+      
+      // Mejorar navigator.userAgent para Google Auth
+      Object.defineProperty(navigator, 'userAgent', {
+        get: function() { return '${UA}'; },
+        configurable: true
+      });
     }catch(e){}
 
     // share → RN
@@ -253,6 +298,16 @@ const INJECT_MAIN = `
     window.addEventListener('scroll', onScroll, {passive:true});
     document.addEventListener('DOMContentLoaded', sendURL);
     window.addEventListener('hashchange', sendURL);
+    
+    // Manejar visibilidad de la página para evitar pantalla negra
+    document.addEventListener('visibilitychange', function() {
+      if (document.visibilityState === 'visible') {
+        post('PAGE_VISIBLE');
+      } else {
+        post('PAGE_HIDDEN');
+      }
+    });
+    
     // llamadas iniciales
     sendURL();
     post('PAGE_READY');
@@ -407,18 +462,93 @@ export default function App() {
   const [mainUrl, setMainUrl] = useState<string | null>(null); // evita flash del home
   const [payVisible, setPayVisible] = useState(false);
   const [payUrl, setPayUrl] = useState<string | null>(null);
+  const [isConnected, setIsConnected] = useState<boolean>(true);
+  const [appState, setAppState] = useState<AppStateStatus>(
+    AppState.currentState
+  );
+  const [isAppReady, setIsAppReady] = useState<boolean>(false);
 
   // última URL real de la principal (para Referer)
   const lastMainUrlRef = useRef<string>(HOME_URL);
   // bypass una vez para permitir que la principal navegue a PayPhone si hace falta
   const bypassNextPayInterceptRef = useRef<boolean>(false);
   const initialPayUrlRef = useRef<string | null>(null);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 
-  // inmersivo al montar y al volver al foreground
+  // Inicialización de la app y manejo de SplashScreen
+  useEffect(() => {
+    const initializeApp = async () => {
+      try {
+        await SplashScreen.preventAutoHideAsync();
+        await ensureImmersive();
+
+        // Limpiar caché viejo si es necesario (cada 7 días)
+        const lastClearKey = "@kestore_last_cache_clear";
+        const lastClear = await AsyncStorage.getItem(lastClearKey);
+        const now = Date.now();
+        const sevenDays = 7 * 24 * 60 * 60 * 1000;
+
+        if (!lastClear || now - parseInt(lastClear) > sevenDays) {
+          log("Limpiando caché antiguo...");
+          await clearAppCache();
+          await AsyncStorage.setItem(lastClearKey, now.toString());
+        }
+
+        setIsAppReady(true);
+        await SplashScreen.hideAsync();
+      } catch (error) {
+        log("Error inicializando app", error);
+        setIsAppReady(true);
+        await SplashScreen.hideAsync();
+      }
+    };
+
+    initializeApp();
+  }, []);
+
+  // Monitoreo de conectividad de red
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      setIsConnected(state.isConnected ?? true);
+      if (state.isConnected) {
+        log("Conexión restaurada");
+      } else {
+        log("Sin conexión a internet");
+      }
+    });
+
+    return unsubscribe;
+  }, []);
+
+  // inmersivo al montar y al volver al foreground + manejo de estado de app
   useEffect(() => {
     ensureImmersive();
-    const sub = AppState.addEventListener("change", (s) => {
-      if (s === "active") ensureImmersive();
+    const sub = AppState.addEventListener("change", (nextAppState) => {
+      const prevAppState = appStateRef.current;
+      appStateRef.current = nextAppState;
+      setAppState(nextAppState);
+
+      log(`AppState cambió de ${prevAppState} a ${nextAppState}`);
+
+      if (nextAppState === "active") {
+        ensureImmersive();
+        // Recargar WebView si estuvo en background por mucho tiempo
+        if (prevAppState === "background") {
+          setTimeout(() => {
+            if (webRef.current) {
+              webRef.current.injectJavaScript(`
+                (function() {
+                  try {
+                    if (document.visibilityState === 'visible') {
+                      window.ReactNativeWebView.postMessage('APP_RESUMED');
+                    }
+                  } catch(e) {}
+                })(); true;
+              `);
+            }
+          }, 100);
+        }
+      }
     });
     return () => sub.remove();
   }, []);
@@ -471,6 +601,23 @@ export default function App() {
 
     if (raw === "PAGE_READY") {
       log("Página principal lista");
+      return;
+    }
+
+    if (raw === "PAGE_VISIBLE") {
+      log("Página visible - restaurando estado");
+      ensureImmersive();
+      return;
+    }
+
+    if (raw === "PAGE_HIDDEN") {
+      log("Página oculta - guardando estado");
+      return;
+    }
+
+    if (raw === "APP_RESUMED") {
+      log("App resumida desde background");
+      ensureImmersive();
       return;
     }
 
@@ -662,6 +809,18 @@ export default function App() {
   }, []);
 
   // ============== Render ==============
+  if (!isAppReady) {
+    return (
+      <View style={styles.container}>
+        <StatusBar
+          translucent
+          backgroundColor="transparent"
+          barStyle="light-content"
+        />
+      </View>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <StatusBar
@@ -676,12 +835,21 @@ export default function App() {
       ) : (
         <WebView
           ref={webRef}
-          source={{ uri: mainUrl }}
+          source={{
+            uri: mainUrl,
+            headers: {
+              Accept:
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+              "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+              "Cache-Control": "no-cache",
+              Pragma: "no-cache",
+            },
+          }}
           userAgent={UA}
           originWhitelist={["*"]}
           javaScriptEnabled
           domStorageEnabled
-          cacheEnabled
+          cacheEnabled={false}
           allowFileAccess={false}
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
@@ -692,13 +860,76 @@ export default function App() {
           setSupportMultipleWindows={false}
           textZoom={100}
           mixedContentMode="compatibility"
+          allowsFullscreenVideo
+          allowsProtectedMedia
+          incognito={false}
           injectedJavaScript={INJECT_MAIN}
           onMessage={onMainMessage}
           onShouldStartLoadWithRequest={onMainShouldStart}
           onNavigationStateChange={onMainNavChange}
-          onError={(e) => log("Main WebView error", e.nativeEvent)}
-          onHttpError={(e) => log("Main WebView HTTP error", e.nativeEvent)}
+          onError={(e) => {
+            const errorDesc = e.nativeEvent.description || "";
+            log("Main WebView error", e.nativeEvent);
+
+            if (isSSLError(errorDesc)) {
+              log("SSL Error detectado, intentando recargar...");
+              showUserFriendlyError(ERROR_TYPES.SSL_ERROR);
+              setTimeout(() => {
+                if (webRef.current) {
+                  webRef.current.reload();
+                }
+              }, 2000);
+            } else if (isNetworkError(errorDesc)) {
+              log("Network Error detectado");
+              showUserFriendlyError(ERROR_TYPES.NETWORK_ERROR);
+              // Intentar recargar después de un tiempo más largo para errores de red
+              setTimeout(() => {
+                if (webRef.current && isConnected) {
+                  webRef.current.reload();
+                }
+              }, 5000);
+            } else {
+              // Error genérico
+              log("Error genérico en WebView principal");
+              setTimeout(() => {
+                if (webRef.current) {
+                  webRef.current.reload();
+                }
+              }, 3000);
+            }
+          }}
+          onHttpError={(e) => {
+            log("Main WebView HTTP error", e.nativeEvent);
+            // Manejar errores HTTP específicos
+            if (e.nativeEvent.statusCode >= 500) {
+              setTimeout(() => {
+                if (webRef.current) {
+                  webRef.current.reload();
+                }
+              }, 3000);
+            }
+          }}
+          onLoadStart={() => log("WebView cargando...")}
+          onLoadEnd={() => log("WebView carga completada")}
           startInLoadingState
+          renderLoading={() => (
+            <View
+              style={[
+                styles.web,
+                { justifyContent: "center", alignItems: "center" },
+              ]}
+            >
+              <View
+                style={{
+                  backgroundColor: "#000",
+                  padding: 20,
+                  borderRadius: 10,
+                }}
+              >
+                {/* Aquí podrías agregar un spinner si quieres */}
+              </View>
+            </View>
+          )}
           style={styles.web}
         />
       )}
@@ -715,13 +946,16 @@ export default function App() {
                 Origin: lastMainUrlRef.current?.startsWith("https://")
                   ? new URL(lastMainUrlRef.current).origin
                   : "https://www.kestore.com.ec",
+                Accept:
+                  "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
               },
             }}
             userAgent={UA}
             originWhitelist={["*"]}
             javaScriptEnabled
             domStorageEnabled
-            cacheEnabled
+            cacheEnabled={false}
             allowFileAccess={false}
             allowsInlineMediaPlayback
             mediaPlaybackRequiresUserAction={false}
@@ -733,21 +967,55 @@ export default function App() {
             textZoom={100}
             mixedContentMode="compatibility"
             androidLayerType="hardware"
+            allowsFullscreenVideo
+            allowsProtectedMedia
+            incognito={false}
             injectedJavaScript={INJECT_PAY}
             onMessage={onPayMessage}
             onShouldStartLoadWithRequest={onPayShouldStart}
             onNavigationStateChange={onPayNavChange}
             onError={(e) => {
+              const errorDesc = e.nativeEvent.description || "";
               log("PayPhone WebView error", e.nativeEvent);
-              if (__DEV__)
-                Alert.alert(
-                  "PayPhone",
-                  `Error de conexión: ${e.nativeEvent.description}`
-                );
+
+              if (isSSLError(errorDesc)) {
+                log("SSL Error en PayPhone, intentando recargar...");
+                showUserFriendlyError(ERROR_TYPES.PAYPHONE_ERROR);
+                setTimeout(() => {
+                  if (payRef.current) {
+                    payRef.current.reload();
+                  }
+                }, 1500);
+              } else if (isNetworkError(errorDesc)) {
+                log("Network Error en PayPhone");
+                showUserFriendlyError(ERROR_TYPES.NETWORK_ERROR);
+                setTimeout(() => {
+                  if (payRef.current && isConnected) {
+                    payRef.current.reload();
+                  }
+                }, 3000);
+              } else {
+                log("Error genérico en PayPhone");
+                if (__DEV__) {
+                  Alert.alert("PayPhone", `Error de conexión: ${errorDesc}`);
+                } else {
+                  showUserFriendlyError(ERROR_TYPES.PAYPHONE_ERROR);
+                }
+              }
             }}
-            onHttpError={(e) =>
-              log("PayPhone WebView HTTP error", e.nativeEvent)
-            }
+            onHttpError={(e) => {
+              log("PayPhone WebView HTTP error", e.nativeEvent);
+              // Reintentar en errores 5xx
+              if (e.nativeEvent.statusCode >= 500) {
+                setTimeout(() => {
+                  if (payRef.current) {
+                    payRef.current.reload();
+                  }
+                }, 2000);
+              }
+            }}
+            onLoadStart={() => log("PayPhone cargando...")}
+            onLoadEnd={() => log("PayPhone carga completada")}
             startInLoadingState
             style={styles.web}
           />

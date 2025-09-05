@@ -18,6 +18,48 @@ const NETWORK_XML = `<?xml version="1.0" encoding="utf-8"?>
       <certificates src="@raw/sectigo_r46" />
     </trust-anchors>
   </base-config>
+  
+  <!-- Configuración específica para PayPhone -->
+  <domain-config>
+    <domain includeSubdomains="true">payphonetodoesposible.com</domain>
+    <domain includeSubdomains="true">pay.payphonetodoesposible.com</domain>
+    <domain includeSubdomains="true">www.payphonetodoesposible.com</domain>
+    <trust-anchors>
+      <certificates src="system" />
+      <certificates src="@raw/sectigo_r46" />
+    </trust-anchors>
+  </domain-config>
+  
+  <!-- Configuración para Kestore -->
+  <domain-config>
+    <domain includeSubdomains="true">kestore.com.ec</domain>
+    <domain includeSubdomains="true">www.kestore.com.ec</domain>
+    <trust-anchors>
+      <certificates src="system" />
+      <certificates src="@raw/sectigo_r46" />
+    </trust-anchors>
+  </domain-config>
+  
+  <!-- Configuración para Google Services (para autenticación) -->
+  <domain-config>
+    <domain includeSubdomains="true">accounts.google.com</domain>
+    <domain includeSubdomains="true">googleapis.com</domain>
+    <domain includeSubdomains="true">gstatic.com</domain>
+    <domain includeSubdomains="true">googleusercontent.com</domain>
+    <trust-anchors>
+      <certificates src="system" />
+    </trust-anchors>
+  </domain-config>
+  
+  <!-- Configuración para CDNs comunes -->
+  <domain-config>
+    <domain includeSubdomains="true">cloudflare.com</domain>
+    <domain includeSubdomains="true">amazonaws.com</domain>
+    <domain includeSubdomains="true">cloudfront.net</domain>
+    <trust-anchors>
+      <certificates src="system" />
+    </trust-anchors>
+  </domain-config>
 </network-security-config>
 `;
 
