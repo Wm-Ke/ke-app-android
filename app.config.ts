@@ -7,7 +7,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   name: "Keapp",
   slug: "keapp",
   scheme: "kestoreec",
-  version: "1.0.10", // <- Versión actualizada con mejoras
+  version: "1.0.11", // <- Versión con máxima compatibilidad Android
   orientation: "default",
   userInterfaceStyle: "automatic",
   owner: "wm-notificaciones",
@@ -27,7 +27,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   },
   // Si prefieres no actualizar esto a mano, puedes usar:
   // runtimeVersion: { policy: "appVersion" },
-  runtimeVersion: "1.0.10",
+  runtimeVersion: "1.0.11",
 
   extra: {
     eas: { projectId: "d1ba3c41-db4d-4c80-95a3-1a18dfa35aab" },
@@ -42,7 +42,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   // ====== ANDROID ONLY ======
   android: {
     package: "com.ke.ecuadorv2",
-    versionCode: 16, // <- Incrementado para nueva versión
+    versionCode: 17, // <- Incrementado para compatibilidad máxima
     adaptiveIcon: {
       foregroundImage: "./assets/images/adaptive-icon.png",
       backgroundColor: "#000000",

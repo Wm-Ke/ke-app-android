@@ -49,7 +49,7 @@ const PAY_ERR_KEYS = [
 
 // UA móvil realista - Actualizado para mejor compatibilidad con Google Auth
 const UA =
-  "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36 KeApp/1.0.9";
+  "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36 KeApp/1.0.10";
 
 // ================= Persistencia =================
 const LAST_URL_KEY = "@kestore_last_url";
@@ -256,20 +256,47 @@ const INJECT_MAIN = `
 
     // Mejorar compatibilidad con Google Auth
     try{
-      // Asegurar que window.open funcione correctamente
+      // Configurar manejo específico para Google OAuth
       var originalOpen = window.open;
       window.open = function(url, target, features) {
-        if (url && url.includes('accounts.google.com')) {
-          // Para Google Auth, usar la ventana actual
-          window.location.href = url;
-          return window;
+        if (url && (url.includes('accounts.google.com') || url.includes('oauth'))) {
+          // Para Google Auth, mantener en la misma ventana pero con mejor manejo
+          if (target === '_blank' || target === '_new') {
+            // Forzar que se abra en la misma ventana para OAuth
+            window.location.href = url;
+            return window;
+          }
+          return originalOpen.call(this, url, '_self', features);
         }
         return originalOpen.call(this, url, target, features);
+      };
+      
+      // Interceptar redirects de Google para evitar que abra YouTube
+      var originalAssign = window.location.assign;
+      window.location.assign = function(url) {
+        if (url && url.includes('youtube.com') && document.referrer.includes('google.com')) {
+          // Si viene de Google y va a YouTube, probablemente es un error de redirect
+          console.log('Interceptando redirect incorrecto a YouTube desde Google Auth');
+          return;
+        }
+        return originalAssign.call(this, url);
       };
       
       // Mejorar navigator.userAgent para Google Auth
       Object.defineProperty(navigator, 'userAgent', {
         get: function() { return '${UA}'; },
+        configurable: true
+      });
+      
+      // Configurar propiedades adicionales para mejor compatibilidad con Google
+      Object.defineProperty(navigator, 'platform', {
+        get: function() { return 'Linux armv7l'; },
+        configurable: true
+      });
+      
+      // Asegurar que Google detecte que es un dispositivo móvil
+      Object.defineProperty(navigator, 'maxTouchPoints', {
+        get: function() { return 5; },
         configurable: true
       });
     }catch(e){}
@@ -307,6 +334,51 @@ const INJECT_MAIN = `
         post('PAGE_HIDDEN');
       }
     });
+    
+    // Detectar y manejar Google OAuth
+    function handleGoogleOAuth() {
+      // Detectar si estamos en una página de Google OAuth
+      if (location.hostname.includes('accounts.google.com')) {
+        console.log('Google OAuth page detected');
+        
+        // Mejorar la experiencia de OAuth
+        var style = document.createElement('style');
+        style.textContent = 'body { -webkit-user-select: text !important; }';
+        document.head.appendChild(style);
+        
+        // Detectar cuando el OAuth se complete exitosamente
+        var observer = new MutationObserver(function(mutations) {
+          mutations.forEach(function(mutation) {
+            if (mutation.type === 'childList') {
+              // Buscar indicadores de OAuth exitoso
+              var successElements = document.querySelectorAll('[data-value*="success"], .success, #success');
+              if (successElements.length > 0) {
+                console.log('Google OAuth success detected');
+                post('GOOGLE_OAUTH_SUCCESS');
+              }
+            }
+          });
+        });
+        
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true
+        });
+      }
+      
+      // Detectar si regresamos a Kestore después de OAuth
+      if (location.hostname.includes('kestore.com.ec') && document.referrer.includes('google.com')) {
+        console.log('Returned to Kestore from Google OAuth');
+        post('GOOGLE_OAUTH_RETURN');
+      }
+    }
+    
+    // Ejecutar detección de OAuth
+    handleGoogleOAuth();
+    
+    // También ejecutar cuando cambie la URL
+    window.addEventListener('hashchange', handleGoogleOAuth);
+    window.addEventListener('popstate', handleGoogleOAuth);
     
     // llamadas iniciales
     sendURL();
@@ -621,6 +693,26 @@ export default function App() {
       return;
     }
 
+    if (raw === "GOOGLE_OAUTH_SUCCESS") {
+      log("Google OAuth completado exitosamente");
+      // Asegurar que la app esté en estado correcto
+      ensureImmersive();
+      return;
+    }
+
+    if (raw === "GOOGLE_OAUTH_RETURN") {
+      log("Regreso a Kestore desde Google OAuth");
+      // Restaurar estado de la app
+      ensureImmersive();
+      // Limpiar caché para asegurar que los datos de sesión se actualicen
+      setTimeout(() => {
+        if (webRef.current) {
+          webRef.current.reload();
+        }
+      }, 1000);
+      return;
+    }
+
     if (raw.startsWith("URL|")) {
       const href = decodeURIComponent(raw.slice(4));
       if (href && isHttp(href) && isKestore(href)) {
@@ -660,6 +752,21 @@ export default function App() {
       };
       const host = hostOf(url);
       log("Main shouldStart", { url, navigationType, host });
+
+      // Manejo especial para Google OAuth
+      if (
+        host.includes("accounts.google.com") ||
+        host.includes("oauth.google.com")
+      ) {
+        log("Google OAuth detectado, permitiendo navegación", { url });
+        return true;
+      }
+
+      // Prevenir redirects incorrectos a YouTube desde Google Auth
+      if (host.includes("youtube.com") && mainUrl.includes("google.com")) {
+        log("Bloqueando redirect incorrecto a YouTube desde Google Auth");
+        return false;
+      }
 
       // Schemes directos
       if (!isHttp(url) && isSocialScheme(url)) {

@@ -1,6 +1,6 @@
 {
   "name": "keapp",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",

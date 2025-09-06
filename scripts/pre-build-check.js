@@ -184,12 +184,26 @@ function checkUserAgent() {
 
     const userAgent = uaMatch[1];
 
-    if (userAgent.includes("KeApp/1.0.9")) {
+    if (userAgent.includes("KeApp/1.0.10")) {
       log("✅ User Agent actualizado correctamente", colors.green);
       log(`   ${userAgent}`, colors.yellow);
-      return true;
+
+      // Verificar que también tenga configuración para Google Auth
+      if (
+        userAgent.includes("Chrome/") &&
+        userAgent.includes("Mobile Safari/")
+      ) {
+        log("✅ User Agent compatible con Google OAuth", colors.green);
+        return true;
+      } else {
+        log(
+          "⚠️  User Agent podría tener problemas con Google OAuth",
+          colors.yellow
+        );
+        return true; // No es crítico, pero es una advertencia
+      }
     } else {
-      log("❌ User Agent no contiene la versión correcta (1.0.9)", colors.red);
+      log("❌ User Agent no contiene la versión correcta (1.0.10)", colors.red);
       log(`   ${userAgent}`, colors.yellow);
       return false;
     }
@@ -206,6 +220,189 @@ function checkUtilsFile() {
     "src/utils/AppUtils.ts",
     "Archivo de utilidades AppUtils.ts"
   );
+}
+
+function getAndroidVersionName(apiLevel) {
+  const versions = {
+    21: "5.0 Lollipop",
+    22: "5.1 Lollipop",
+    23: "6.0 Marshmallow",
+    24: "7.0 Nougat",
+    25: "7.1 Nougat",
+    26: "8.0 Oreo",
+    27: "8.1 Oreo",
+    28: "9.0 Pie",
+    29: "10",
+    30: "11",
+    31: "12",
+    32: "12L",
+    33: "13",
+    34: "14",
+    35: "15",
+  };
+  return versions[apiLevel] || `API ${apiLevel}`;
+}
+
+function checkAndroidApiLevel() {
+  log("\n📱 Verificando nivel de API de Android...", colors.blue);
+
+  let allGood = true;
+
+  try {
+    // Verificar android/build.gradle
+    const buildGradleContent = fs.readFileSync(
+      path.join(PROJECT_ROOT, "android/build.gradle"),
+      "utf8"
+    );
+
+    const targetSdkMatch = buildGradleContent.match(/targetSdkVersion.*?(\d+)/);
+    const compileSdkMatch = buildGradleContent.match(
+      /compileSdkVersion.*?(\d+)/
+    );
+    const minSdkMatch = buildGradleContent.match(/minSdkVersion.*?(\d+)/);
+
+    if (targetSdkMatch) {
+      const targetSdk = parseInt(targetSdkMatch[1]);
+      if (targetSdk >= 35) {
+        log(`✅ Target SDK Version: ${targetSdk} (Android 15+)`, colors.green);
+      } else {
+        log(
+          `❌ Target SDK Version: ${targetSdk} (Debe ser 35+ para Android 15)`,
+          colors.red
+        );
+        log(
+          "   Google Play requiere Android 15 (API 35) desde agosto 2025",
+          colors.yellow
+        );
+        allGood = false;
+      }
+    }
+
+    if (compileSdkMatch) {
+      const compileSdk = parseInt(compileSdkMatch[1]);
+      if (compileSdk >= 35) {
+        log(`✅ Compile SDK Version: ${compileSdk}`, colors.green);
+      } else {
+        log(`❌ Compile SDK Version: ${compileSdk} (Debe ser 35+)`, colors.red);
+        allGood = false;
+      }
+    }
+
+    if (minSdkMatch) {
+      const minSdk = parseInt(minSdkMatch[1]);
+      if (minSdk <= 21) {
+        log(
+          `✅ Min SDK Version: ${minSdk} (Android ${getAndroidVersionName(minSdk)}) - Máxima compatibilidad`,
+          colors.green
+        );
+      } else if (minSdk <= 24) {
+        log(
+          `✅ Min SDK Version: ${minSdk} (Android ${getAndroidVersionName(minSdk)}) - Buena compatibilidad`,
+          colors.yellow
+        );
+      } else {
+        log(
+          `⚠️ Min SDK Version: ${minSdk} (Android ${getAndroidVersionName(minSdk)}) - Compatibilidad limitada`,
+          colors.yellow
+        );
+      }
+    }
+
+    // Verificar app.config.ts
+    const appConfigContent = fs.readFileSync(
+      path.join(PROJECT_ROOT, "app.config.ts"),
+      "utf8"
+    );
+
+    if (appConfigContent.includes("targetSdkVersion: 35")) {
+      log("✅ App.config.ts configurado para Android 15", colors.green);
+    } else {
+      log("❌ App.config.ts no tiene targetSdkVersion: 35", colors.red);
+      allGood = false;
+    }
+
+    return allGood;
+  } catch (error) {
+    log(`❌ Error verificando nivel de API: ${error.message}`, colors.red);
+    return false;
+  }
+}
+
+function checkGoogleOAuthConfiguration() {
+  log("\n🔐 Verificando configuración de Google OAuth...", colors.blue);
+
+  let allGood = true;
+
+  try {
+    // Verificar AndroidManifest.xml para queries de Google
+    const manifestContent = fs.readFileSync(
+      path.join(PROJECT_ROOT, "android/app/src/main/AndroidManifest.xml"),
+      "utf8"
+    );
+
+    if (manifestContent.includes("com.google.android.gms")) {
+      log(
+        "✅ Google Play Services configurado en AndroidManifest",
+        colors.green
+      );
+    } else {
+      log(
+        "❌ Google Play Services no encontrado en AndroidManifest",
+        colors.red
+      );
+      allGood = false;
+    }
+
+    if (manifestContent.includes("accounts.google.com")) {
+      log("✅ Queries para Google OAuth configuradas", colors.green);
+    } else {
+      log("❌ Queries para Google OAuth no encontradas", colors.red);
+      allGood = false;
+    }
+
+    // Verificar network security config para Google
+    const networkConfigContent = fs.readFileSync(
+      path.join(
+        PROJECT_ROOT,
+        "android/app/src/main/res/xml/network_security_config.xml"
+      ),
+      "utf8"
+    );
+
+    if (
+      networkConfigContent.includes("accounts.google.com") &&
+      networkConfigContent.includes("googleapis.com")
+    ) {
+      log("✅ Configuración SSL para Google OAuth", colors.green);
+    } else {
+      log("❌ Configuración SSL para Google OAuth incompleta", colors.red);
+      allGood = false;
+    }
+
+    // Verificar App.tsx para manejo de OAuth
+    const appContent = fs.readFileSync(
+      path.join(PROJECT_ROOT, "App.tsx"),
+      "utf8"
+    );
+
+    if (
+      appContent.includes("GOOGLE_OAUTH_SUCCESS") &&
+      appContent.includes("handleGoogleOAuth")
+    ) {
+      log("✅ Manejo de Google OAuth implementado en App.tsx", colors.green);
+    } else {
+      log("❌ Manejo de Google OAuth no encontrado en App.tsx", colors.red);
+      allGood = false;
+    }
+
+    return allGood;
+  } catch (error) {
+    log(
+      `❌ Error verificando configuración de Google OAuth: ${error.message}`,
+      colors.red
+    );
+    return false;
+  }
 }
 
 function main() {
@@ -242,6 +439,12 @@ function main() {
 
   // Verificar utilidades
   allChecksPass &= checkUtilsFile();
+
+  // Verificar nivel de API de Android
+  allChecksPass &= checkAndroidApiLevel();
+
+  // Verificar configuración de Google OAuth
+  allChecksPass &= checkGoogleOAuthConfiguration();
 
   // Resultado final
   log("\n" + "=".repeat(50));
